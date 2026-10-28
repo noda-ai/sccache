@@ -54,6 +54,10 @@ impl Storage for ReadOnlyStorage {
         self.0.cache_type_name()
     }
 
+    fn multilevel_stats(&self) -> Option<crate::cache::multilevel::MultiLevelStats> {
+        self.0.multilevel_stats()
+    }
+
     /// Get the current storage usage, if applicable.
     async fn current_size(&self) -> Result<Option<u64>> {
         self.0.current_size().await
@@ -115,6 +119,47 @@ mod test {
             storage.check().now_or_never().unwrap().unwrap(),
             CacheMode::ReadOnly
         );
+    }
+
+    #[test]
+    fn readonly_storage_forwards_live_multilevel_stats_without_allowing_writes() {
+        use crate::cache::multilevel::MultiLevelStorage;
+
+        let l0 = Arc::new(MockStorage::new(None, false));
+        let l1 = Arc::new(MockStorage::new(None, false));
+        let storage = ReadOnlyStorage(Arc::new(MultiLevelStorage::new(vec![
+            l0.clone(),
+            l1.clone(),
+        ])));
+        let before = storage.multilevel_stats().expect("per-tier statistics");
+        assert_eq!(before.0.len(), 2);
+        assert!(before.0.iter().all(|level| level.misses == 0));
+
+        l0.next_get(Ok(Cache::Miss));
+        l1.next_get(Ok(Cache::Miss));
+        assert!(matches!(
+            storage.get("missing").now_or_never().unwrap().unwrap(),
+            Cache::Miss
+        ));
+        assert!(
+            storage
+                .put("blocked", CacheWrite::default())
+                .now_or_never()
+                .unwrap()
+                .is_err()
+        );
+
+        let after = storage
+            .multilevel_stats()
+            .expect("per-tier statistics after read");
+        assert!(after.0.iter().all(|level| level.misses == 1));
+        assert!(after.0.iter().all(|level| level.writes == 0));
+    }
+
+    #[test]
+    fn readonly_storage_preserves_absent_multilevel_stats() {
+        let storage = ReadOnlyStorage(Arc::new(MockStorage::new(None, false)));
+        assert!(storage.multilevel_stats().is_none());
     }
 
     #[test]

@@ -197,6 +197,11 @@ fn test_multi_level_storage_backfill_on_hit() {
 struct InMemoryStorage {
     data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     access_log: Arc<Mutex<Vec<String>>>,
+    check_calls: AtomicU64,
+    fail_first_check: bool,
+    /// Leading check() calls that report ReadOnly, as RemoteStorage does when
+    /// its write probe fails.
+    read_only_checks: u64,
 }
 
 impl InMemoryStorage {
@@ -204,6 +209,9 @@ impl InMemoryStorage {
         Self {
             data: Arc::new(Mutex::new(HashMap::new())),
             access_log: Arc::new(Mutex::new(Vec::new())),
+            check_calls: AtomicU64::new(0),
+            fail_first_check: false,
+            read_only_checks: 0,
         }
     }
 
@@ -239,7 +247,17 @@ impl Storage for InMemoryStorage {
     }
 
     async fn check(&self) -> Result<CacheMode> {
-        Ok(CacheMode::ReadWrite)
+        let attempt = self.check_calls.fetch_add(1, Ordering::SeqCst);
+        // Yield so concurrent callers exercise capability-probe coalescing.
+        tokio::task::yield_now().await;
+        if self.fail_first_check && attempt == 0 {
+            return Err(anyhow!("temporary capability probe failure"));
+        }
+        Ok(if attempt < self.read_only_checks {
+            CacheMode::ReadOnly
+        } else {
+            CacheMode::ReadWrite
+        })
     }
 
     fn location(&self) -> String {
@@ -1502,4 +1520,113 @@ fn test_multilevel_put_raw_writes_to_all_levels() {
             "L1 should have the raw bytes"
         );
     });
+}
+
+#[tokio::test]
+async fn test_l0_concurrent_uploads_share_capability_probe() {
+    let local = Arc::new(InMemoryStorage::new());
+    let remote = Arc::new(InMemoryStorage::new());
+    let storage = Arc::new(MultiLevelStorage::with_write_error_policy(
+        vec![local.clone(), remote.clone()],
+        WriteErrorPolicy::L0,
+    ));
+    let mut uploads = Vec::new();
+    for n in 0..64 {
+        let storage = storage.clone();
+        uploads.push(tokio::spawn(async move {
+            storage
+                .put_raw(&format!("key-{n}"), Bytes::from_static(b"value"))
+                .await
+                .unwrap();
+        }));
+    }
+    for upload in uploads {
+        upload.await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while storage.stats().0[1].writes != 64 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(remote.data.lock().await.len(), 64);
+    assert_eq!(local.check_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(remote.check_calls.load(Ordering::SeqCst), 1);
+    // The server's later health check reuses the same per-level capabilities.
+    assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+    assert_eq!(remote.check_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_capability_probe_error_is_retried() {
+    let remote = Arc::new(InMemoryStorage {
+        fail_first_check: true,
+        ..InMemoryStorage::new()
+    });
+    let storage = MultiLevelStorage::new(vec![remote.clone()]);
+    assert!(storage.check().await.is_err());
+    assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+    assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+    assert_eq!(remote.check_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_l0_readonly_capability_prevents_remote_writes() {
+    let local = Arc::new(InMemoryStorage::new());
+    let remote = Arc::new(InMemoryStorage {
+        read_only_checks: u64::MAX,
+        ..InMemoryStorage::new()
+    });
+    let storage = MultiLevelStorage::with_write_error_policy(
+        vec![local.clone(), remote.clone()],
+        WriteErrorPolicy::L0,
+    );
+    for n in 0..4 {
+        storage
+            .put_raw(&format!("key-{n}"), Bytes::from_static(b"value"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(local.data.lock().await.len(), 4);
+    assert!(remote.data.lock().await.is_empty());
+    // ReadOnly is not cached: each upload and the health check re-probe.
+    assert_eq!(remote.check_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(storage.check().await.unwrap(), CacheMode::ReadOnly);
+    assert_eq!(remote.check_calls.load(Ordering::SeqCst), 5);
+}
+
+#[tokio::test]
+async fn test_l0_transient_readonly_probe_recovers() {
+    let local = Arc::new(InMemoryStorage::new());
+    // The first probe's write fails transiently, which RemoteStorage reports
+    // as ReadOnly rather than an error.
+    let remote = Arc::new(InMemoryStorage {
+        read_only_checks: 1,
+        ..InMemoryStorage::new()
+    });
+    let storage = MultiLevelStorage::with_write_error_policy(
+        vec![local.clone(), remote.clone()],
+        WriteErrorPolicy::L0,
+    );
+    for n in 0..4 {
+        storage
+            .put_raw(&format!("key-{n}"), Bytes::from_static(b"value"))
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while storage.stats().0[1].writes != 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(local.data.lock().await.len(), 4);
+    assert_eq!(remote.data.lock().await.len(), 3);
+    assert!(!remote.data.lock().await.contains_key("key-0"));
+    // One ReadOnly probe, then one ReadWrite probe that is cached.
+    assert_eq!(remote.check_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(storage.check().await.unwrap(), CacheMode::ReadWrite);
+    assert_eq!(remote.check_calls.load(Ordering::SeqCst), 2);
 }

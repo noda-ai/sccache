@@ -345,6 +345,10 @@ impl MultiLevelStats {
 pub struct MultiLevelStorage {
     levels: Vec<Arc<dyn Storage>>,
     write_error_policy: WriteErrorPolicy,
+    /// Capability probes may perform remote writes. Share one ReadWrite probe
+    /// result per level for this daemon instead of probing the same object per
+    /// upload.
+    level_modes: Vec<tokio::sync::OnceCell<CacheMode>>,
     /// Lock-free atomic statistics per level
     atomic_stats: Vec<Arc<AtomicLevelStats>>,
     /// Base directories for path normalization, propagated to compiler pipeline
@@ -380,10 +384,15 @@ impl MultiLevelStorage {
     ) -> Self {
         let atomic_stats = AtomicLevelStats::from_levels(&levels);
         let basedirs = Self::collect_basedirs(&levels);
+        let level_modes = levels
+            .iter()
+            .map(|_| tokio::sync::OnceCell::new())
+            .collect();
 
         MultiLevelStorage {
             levels,
             write_error_policy,
+            level_modes,
             atomic_stats,
             basedirs,
         }
@@ -392,6 +401,26 @@ impl MultiLevelStorage {
     /// Get a snapshot of current multi-level cache statistics.
     pub fn stats(&self) -> MultiLevelStats {
         MultiLevelStats(self.atomic_stats.iter().map(|s| s.snapshot()).collect())
+    }
+
+    async fn level_mode(&self, idx: usize) -> Result<CacheMode> {
+        // Only ReadWrite is cached. Remote backends report a failed write probe
+        // as ReadOnly, so a transient failure must not disable the level for
+        // the daemon's lifetime; ReadOnly and errors are re-probed next time.
+        // Cancellation also leaves the cell empty. Actual writes still report
+        // failures if access or connectivity changes after a successful probe.
+        match self.level_modes[idx]
+            .get_or_try_init(|| async {
+                match self.levels[idx].check().await {
+                    Ok(CacheMode::ReadWrite) => Ok(CacheMode::ReadWrite),
+                    uncached => Err(uncached),
+                }
+            })
+            .await
+        {
+            Ok(mode) => Ok(*mode),
+            Err(uncached) => uncached,
+        }
     }
 
     /// Create a multi-level storage from configuration.
@@ -596,7 +625,7 @@ impl MultiLevelStorage {
     async fn write_remaining_levels_async(&self, key: &str, data: &Bytes, start_idx: usize) {
         for (idx, level) in self.levels.iter().enumerate().skip(start_idx) {
             // Check if level is read-only before spawning task
-            if matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
+            if matches!(self.level_mode(idx).await, Ok(CacheMode::ReadOnly)) {
                 debug!("Level {} is read-only, skipping write", idx);
                 continue;
             }
@@ -774,7 +803,7 @@ impl Storage for MultiLevelStorage {
                 // Fail only if L0 write fails (unless L0 is read-only)
                 if let Some(l0) = self.levels.first() {
                     // Check if L0 is read-only before attempting write
-                    if matches!(l0.check().await, Ok(CacheMode::ReadOnly)) {
+                    if matches!(self.level_mode(0).await, Ok(CacheMode::ReadOnly)) {
                         debug!("Level 0 is read-only, skipping L0 write");
                     } else {
                         // Attempt write and propagate errors
@@ -819,15 +848,15 @@ impl Storage for MultiLevelStorage {
                         let start = Instant::now();
                         let result = Self::write_entry_from_bytes(&level, &key_str, &data).await;
                         let duration = start.elapsed();
-                        (idx, result, level, duration, stats_arc)
+                        (idx, result, duration, stats_arc)
                     };
 
                     if idx == 0 {
                         // L0 synchronous
-                        let (idx, result, level, duration, stats_arc) = write_task.await;
+                        let (idx, result, duration, stats_arc) = write_task.await;
                         if let Err(e) = result {
                             // Check if read-only before failing
-                            if !matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
+                            if !matches!(self.level_mode(idx).await, Ok(CacheMode::ReadOnly)) {
                                 inc_stat!(stats_arc.as_deref(), write_failures, 1);
                                 return Err(anyhow!(
                                     "Failed to write to cache level {}: {}",
@@ -854,10 +883,10 @@ impl Storage for MultiLevelStorage {
                 drop(tx);
 
                 // Check async results
-                while let Some((idx, result, level, duration, stats_arc)) = rx.recv().await {
+                while let Some((idx, result, duration, stats_arc)) = rx.recv().await {
                     if let Err(e) = result {
                         // Check if read-only before failing
-                        if !matches!(level.check().await, Ok(CacheMode::ReadOnly)) {
+                        if !matches!(self.level_mode(idx).await, Ok(CacheMode::ReadOnly)) {
                             inc_stat!(stats_arc.as_deref(), write_failures, 1);
                             return Err(anyhow!("Failed to write to cache level {}: {}", idx, e));
                         }
@@ -878,8 +907,8 @@ impl Storage for MultiLevelStorage {
 
     async fn check(&self) -> Result<CacheMode> {
         let mut result = CacheMode::ReadWrite;
-        for (idx, level) in self.levels.iter().enumerate() {
-            match level.check().await {
+        for idx in 0..self.levels.len() {
+            match self.level_mode(idx).await {
                 Ok(CacheMode::ReadOnly) => {
                     result = CacheMode::ReadOnly;
                     debug!("Cache level {} is read-only", idx);
